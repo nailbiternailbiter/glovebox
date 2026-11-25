@@ -281,6 +281,12 @@ li.item.flash .text::after{content:"  ✓ done";font-size:12.5px;font-weight:600
 .tin:focus,.tin:focus-visible{outline:none;box-shadow:none}
 .tbtn{align-self:flex-start;margin-top:4px;padding:2px 0;border:0;background:none;color:var(--muted);font-size:14px;text-decoration:underline;text-underline-offset:3px;cursor:pointer}
 .tin.tname{letter-spacing:-.01em}
+.bootscreen input{-webkit-user-select:text;user-select:text;touch-action:manipulation;pointer-events:auto}
+.tform{display:block}
+.tform .tline + .tline{margin-top:clamp(12px,2.2vh,22px)}
+.tacts{display:flex;gap:18px;align-items:baseline;margin:clamp(10px,1.8vh,18px) 0 6px}
+.tacts .tbtn{margin-top:0}
+.tacts .tbtn.tprimary{color:var(--ink);font-size:clamp(16px,2.2vh,19px);font-weight:600}
 .tchoices{gap:4px}
 .tchoices .tbtn{margin-top:2px;color:var(--ink);font-size:clamp(16px,2.2vh,19px)}
 .tchoices .tbtn.tdanger{color:var(--alert)}
@@ -2231,7 +2237,7 @@ function termShow(){
     el.dataset.wired = "1";
     el.addEventListener("click", e=>{
       if(e.target.closest("button,input,#bootdaily")) return;
-      const inp = el.querySelector(".tin"); if(inp) inp.focus(); else if(T) T.fast = true;
+      const ins = [...el.querySelectorAll(".tin")], inp = ins.find(i=>!i.value) || ins[0]; if(inp) inp.focus(); else if(T) T.fast = true;
     });
   }
   return T;
@@ -2247,6 +2253,54 @@ async function tType(txt, speed, cls){
   }
 }
 let tLastAction = "";
+// iOS only raises the keyboard when focus() runs inside a tap. A delayed focus() leaves the field "focused" with no
+// keyboard, and tapping it again then does nothing. So only auto-focus where there's a real keyboard + mouse.
+const canAutoFocus = () => { try{ return matchMedia("(hover: hover) and (pointer: fine)").matches && !(navigator.maxTouchPoints > 0 && /Mac|iP/.test(navigator.platform||"")); }catch(e){ return false; } };
+function autoFocus(el){ if(el && canAutoFocus()) setTimeout(()=>{ if(el.isConnected) el.focus(); }, 40); }
+// safety net: if a field somehow has focus but no keyboard, a tap blurs it first so the native tap-to-focus opens the keyboard
+function armTap(inp){ inp.addEventListener("touchstart", ()=>{ if(document.activeElement===inp && !inp.dataset.typed) inp.blur(); }, {passive:true}); inp.addEventListener("input", ()=>{ inp.dataset.typed = "1"; }); }
+let tFieldN = 0;
+function tField(label, opts){
+  const id = "tin" + (++tFieldN);
+  const line = document.createElement("span"); line.className = "tline";
+  const lab = document.createElement("label"); lab.textContent = label; lab.htmlFor = id; lab.style.cssText = "font-size:inherit";
+  const labWrap = document.createElement("span"); labWrap.append(lab);
+  const inp = document.createElement("input");
+  Object.assign(inp, {id, name:id, className: opts.name ? "tin tname" : "tin", type: opts.secret ? "password" : "text", autocomplete: opts.ac || "off", spellcheck:false});
+  if(opts.name) inp.maxLength = 40;
+  inp.setAttribute("autocapitalize", opts.name ? "words" : "off"); inp.setAttribute("autocorrect", "off");
+  inp.setAttribute("enterkeyhint", opts.hint || "go"); inp.setAttribute("aria-label", label);
+  armTap(inp);
+  line.append(labWrap, inp);
+  return {line, inp};
+}
+// two password fields shown together (new + confirm). Next on the keyboard moves focus inside the same keypress, so the keyboard stays up.
+function tAskPair(l1, l2, opts){
+  opts = opts || {}; tLastAction = "";
+  return new Promise(resolve=>{
+    T.el.classList.add("locked");
+    const form = document.createElement("span"); form.className = "tform";
+    const A = tField(l1, {secret:true, ac:"new-password", hint:"next"}), B = tField(l2, {secret:true, ac:"new-password", hint:"go"});
+    const acts = document.createElement("span"); acts.className = "tacts";
+    const save = document.createElement("button"); save.type = "button"; save.className = "tbtn tprimary"; save.textContent = opts.submit || "Save";
+    save.addEventListener("click", ()=>done(true)); acts.append(save);
+    (opts.actions || []).forEach(a=>{ const b = document.createElement("button"); b.type = "button"; b.className = "tbtn"; b.textContent = a.charAt(0).toUpperCase() + a.slice(1); b.addEventListener("click", ()=>{ tLastAction = a; done(false); }); acts.append(b); });
+    form.append(A.line, B.line, acts);
+    T.cursor.before(form); T.cursor.hidden = true; T.fast = reduceMotion;
+    autoFocus(A.inp);
+    A.inp.addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); B.inp.focus(); } });
+    B.inp.addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); done(true); } });
+    let fin = false;
+    function done(ok){
+      if(fin) return; fin = true;
+      const a = A.inp.value, b = B.inp.value, dots = v => "•".repeat(Math.min(v.length, 12));
+      const echo = document.createElement("span"); echo.className = "tdim";
+      echo.textContent = ok ? "\n" + l1 + ": " + dots(a) + "\n" + l2 + ": " + dots(b) + "\n" : "\n" + l1 + "\n";
+      form.replaceWith(echo);
+      T.cursor.hidden = false; resolve(ok ? [a, b] : null);
+    }
+  });
+}
 function tChoose(options){
   return new Promise(resolve=>{
     T.el.classList.add("locked");
@@ -2260,23 +2314,17 @@ function tChoose(options){
       line.append(b);
     });
     T.cursor.before(line); T.cursor.hidden = true; T.fast = reduceMotion;
-    setTimeout(()=>{ const f = line.querySelector("button"); if(f) f.focus(); }, 40);
+    autoFocus(line.querySelector("button"));
   });
 }
 function tAsk(label, opts){
   opts = opts || {}; tLastAction = "";
   return new Promise(resolve=>{
     T.el.classList.add("locked");
-    const line = document.createElement("span"); line.className = "tline";
-    const lab = document.createElement("span"); lab.textContent = label;
-    const inp = document.createElement("input");
-    Object.assign(inp, {className: opts.name ? "tin tname" : "tin", type: opts.secret ? "password" : "text", autocomplete:"off", spellcheck:false});
-    if(opts.name) inp.maxLength = 40;
-    inp.setAttribute("autocapitalize", opts.name ? "words" : "off"); inp.setAttribute("enterkeyhint","go"); inp.setAttribute("aria-label", label);
-    line.append(lab, inp);
+    const {line, inp} = tField(label, {secret:opts.secret, name:opts.name, ac: opts.secret ? "current-password" : (opts.name ? "name" : "off")});
     (opts.actions || []).forEach(a=>{ const b = document.createElement("button"); b.type = "button"; b.className = "tbtn"; b.textContent = a.charAt(0).toUpperCase() + a.slice(1); b.addEventListener("click", ()=>{ tLastAction = a; done(null); }); line.append(b); });
     T.cursor.before(line); T.cursor.hidden = true; T.fast = reduceMotion;
-    setTimeout(()=>inp.focus(), 40);
+    autoFocus(inp);
     let fin = false;
     function done(v){
       if(fin) return; fin = true;
@@ -2334,11 +2382,10 @@ async function nameFlow(cancelable){
 async function setupFlow(mode){   // mode: "first" | "change"
   const first = mode==="first";
   for(;;){
-    const a = await tAsk(first ? "Create a password" : "New password", {secret:true, actions: first ? [] : ["cancel"]});
-    if(a==null) return "cancel";
+    const r = await tAskPair(first ? "Create a password" : "New password", "Confirm password", {submit: first ? "Create account" : "Save", actions: first ? [] : ["cancel"]});
+    if(r==null) return "cancel";
+    const [a, b] = r;
     if(a.length < 4){ await tType("Use at least 4 characters.\n", 10, "tbad"); continue; }
-    const b = await tAsk("Confirm password", {secret:true, actions: first ? ["start over"] : ["cancel"]});
-    if(b==null){ if(first) continue; return "cancel"; }
     if(b!==a){ await tType("Those didn't match. Try again.\n", 10, "tbad"); continue; }
     await savePass(a); markUnlocked();
     await tType(first ? "Account created. Glovebox will ask for your password every time you open it.\n" : "Password changed.\n", 8, "tdim");
