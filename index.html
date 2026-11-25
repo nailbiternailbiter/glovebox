@@ -280,6 +280,10 @@ li.item.flash .text::after{content:"  ✓ done";font-size:12.5px;font-weight:600
 .tin{width:100%;padding:6px 0 8px;margin:0;border:0;border-bottom:1.5px solid var(--ink);border-radius:0;outline:none;background:transparent;color:var(--ink);caret-color:var(--ink);font-family:var(--sans);font-size:24px;letter-spacing:.3em}
 .tin:focus,.tin:focus-visible{outline:none;box-shadow:none}
 .tbtn{align-self:flex-start;margin-top:4px;padding:2px 0;border:0;background:none;color:var(--muted);font-size:14px;text-decoration:underline;text-underline-offset:3px;cursor:pointer}
+.tin.tname{letter-spacing:-.01em}
+.tchoices{gap:4px}
+.tchoices .tbtn{margin-top:2px;color:var(--ink);font-size:clamp(16px,2.2vh,19px)}
+.tchoices .tbtn.tdanger{color:var(--alert)}
 .bdaily{flex:none;width:100%;max-width:560px;margin:auto auto 0;padding-top:16px;border-top:1px solid var(--dash);display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}
 .bd-col{min-width:0}
 .bd-h{font-size:11px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -511,7 +515,7 @@ ul.glist{list-style:none;margin:0;padding:0;overflow:hidden}
   <div class="foot" hidden>
     <button class="linkbtn" id="clearDone">Clear checked-off items</button>
     <button class="linkbtn" id="exportBtn" hidden>Export backup</button>
-    <button class="linkbtn" id="passBtn">Passcode</button>
+    <button class="linkbtn" id="passBtn">Account</button>
     <button class="linkbtn" id="themeBtn">Light mode</button>
   </div>
 </div>
@@ -2144,10 +2148,14 @@ function updateStatus(){
   (function step(){ if(tok!==statusTok) return; el.textContent = txt.slice(0, ++n); if(n < txt.length) setTimeout(step, 24); })();
 }
 
-/* ---------- boot + passcode terminal ---------- */
+/* ---------- boot + account / password terminal ---------- */
 const LOCK_MS = 30*60e3;
 let settingsData = {}, lockKnown = false, T = null, hiddenAt = 0;
-const validLock = l => (l && typeof l.salt==="string" && typeof l.hash==="string" && /^[0-9a-f]{16,128}$/.test(l.hash)) ? {salt:l.salt, hash:l.hash} : null;
+const validLock = l => (l && typeof l.salt==="string" && typeof l.hash==="string" && /^[0-9a-f]{16,128}$/.test(l.hash))
+  ? Object.assign({salt:l.salt, hash:l.hash},
+      (l.kdf==="pbkdf2" && +l.iter > 0) ? {kdf:"pbkdf2", iter:+l.iter} : {},
+      (typeof l.name==="string" && l.name.trim()) ? {name:l.name.trim().slice(0,40)} : {})
+  : null;
 let lockInfo = (()=>{ try{ return validLock(JSON.parse(localStorage.getItem("glovebox-lock"))); }catch(e){ return null; } })();
 const sleep = ms => new Promise(r=>setTimeout(r, ms));
 const lsGet = k => { try{ return localStorage.getItem(k); }catch(e){ return null; } };
@@ -2166,19 +2174,49 @@ async function digest(text){
     return h.map(x=>x.toString(16).padStart(8,"0")).join("");
   }
 }
-async function checkPass(code){ return !!lockInfo && (await digest(lockInfo.salt+":"+code))===lockInfo.hash; }
+// account = name + password, stored only in this browser (glovebox-lock). Password is a salted PBKDF2-SHA256 hash.
+const PBKDF2_ITER = 210000;
+const hex = buf => [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,"0")).join("");
+async function pbkdf2(pass, salt, iter){
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(pass), "PBKDF2", false, ["deriveBits"]);
+  return hex(await crypto.subtle.deriveBits({name:"PBKDF2", hash:"SHA-256", salt:enc.encode(salt), iterations:iter}, key, 256));
+}
+const hasSubtle = () => !!(window.crypto && crypto.subtle && crypto.subtle.deriveBits);
+const userName = () => ((lockInfo && lockInfo.name) || lsGet("glovebox-user") || "").trim();
 function writeSettings(){ if(settingsDoc) settingsDoc.set(settingsData).catch(()=>toast("Couldn't sync that change. It's saved on this device.")); }
+function saveLock(rec){
+  lockInfo = rec;
+  lsSet("glovebox-lock", JSON.stringify(rec));
+  if(rec.name) lsSet("glovebox-user", rec.name);
+  settingsData.lock = rec; writeSettings();
+}
+async function checkPass(code){
+  if(!lockInfo || !code) return false;
+  if(lockInfo.kdf==="pbkdf2"){ try{ return (await pbkdf2(code, lockInfo.salt, lockInfo.iter))===lockInfo.hash; }catch(e){ return false; } }
+  const ok = (await digest(lockInfo.salt+":"+code))===lockInfo.hash;
+  if(ok && hasSubtle()){ try{ await savePass(code); }catch(e){} }   // upgrade an older SHA-256 record to PBKDF2
+  return ok;
+}
 async function savePass(code){
   const salt = [...crypto.getRandomValues(new Uint8Array(16))].map(b=>b.toString(16).padStart(2,"0")).join("");
-  lockInfo = {salt, hash: await digest(salt+":"+code)};
-  lsSet("glovebox-lock", JSON.stringify(lockInfo));
-  settingsData.lock = lockInfo; writeSettings();
+  let rec;
+  try{ rec = {salt, kdf:"pbkdf2", iter:PBKDF2_ITER, hash: await pbkdf2(code, salt, PBKDF2_ITER)}; }
+  catch(e){ rec = {salt, hash: await digest(salt+":"+code)}; }
+  const n = userName(); if(n) rec.name = n;
+  saveLock(rec);
 }
-function clearPass(){
-  lockInfo = null;
-  try{ localStorage.removeItem("glovebox-lock"); }catch(e){}
-  lsSet("glovebox-lock-skip", "1");
-  delete settingsData.lock; writeSettings();
+function saveName(name){
+  lsSet("glovebox-user", name);
+  if(lockInfo) saveLock(Object.assign({}, lockInfo, {name}));
+}
+function eraseDevice(){
+  try{
+    Object.keys(localStorage).filter(k=>k.startsWith("glovebox")).forEach(k=>localStorage.removeItem(k));
+    sessionStorage.clear();
+  }catch(e){}
+  lockInfo = null; delete settingsData.lock; writeSettings();
+  setTimeout(()=>location.reload(), 500);
 }
 
 function termShow(){
@@ -2208,17 +2246,35 @@ async function tType(txt, speed, cls){
     if(!T.fast) await sleep(speed || 9);
   }
 }
+let tLastAction = "";
+function tChoose(options){
+  return new Promise(resolve=>{
+    T.el.classList.add("locked");
+    const line = document.createElement("span"); line.className = "tline tchoices";
+    options.forEach(o=>{
+      const b = document.createElement("button"); b.type = "button"; b.className = "tbtn" + (/erase/i.test(o) ? " tdanger" : ""); b.textContent = o;
+      b.addEventListener("click", ()=>{
+        const echo = document.createElement("span"); echo.className = "tdim"; echo.textContent = "\n› " + o + "\n";
+        line.replaceWith(echo); T.cursor.hidden = false; resolve(o);
+      });
+      line.append(b);
+    });
+    T.cursor.before(line); T.cursor.hidden = true; T.fast = reduceMotion;
+    setTimeout(()=>{ const f = line.querySelector("button"); if(f) f.focus(); }, 40);
+  });
+}
 function tAsk(label, opts){
-  opts = opts || {};
+  opts = opts || {}; tLastAction = "";
   return new Promise(resolve=>{
     T.el.classList.add("locked");
     const line = document.createElement("span"); line.className = "tline";
     const lab = document.createElement("span"); lab.textContent = label;
     const inp = document.createElement("input");
-    Object.assign(inp, {className:"tin", type: opts.secret ? "password" : "text", autocomplete:"off", spellcheck:false});
-    inp.setAttribute("autocapitalize","off"); inp.setAttribute("enterkeyhint","go"); inp.setAttribute("aria-label", label);
+    Object.assign(inp, {className: opts.name ? "tin tname" : "tin", type: opts.secret ? "password" : "text", autocomplete:"off", spellcheck:false});
+    if(opts.name) inp.maxLength = 40;
+    inp.setAttribute("autocapitalize", opts.name ? "words" : "off"); inp.setAttribute("enterkeyhint","go"); inp.setAttribute("aria-label", label);
     line.append(lab, inp);
-    (opts.actions || []).forEach(a=>{ const b = document.createElement("button"); b.type = "button"; b.className = "tbtn"; b.textContent = a.charAt(0).toUpperCase() + a.slice(1); b.addEventListener("click", ()=>done(null)); line.append(b); });
+    (opts.actions || []).forEach(a=>{ const b = document.createElement("button"); b.type = "button"; b.className = "tbtn"; b.textContent = a.charAt(0).toUpperCase() + a.slice(1); b.addEventListener("click", ()=>{ tLastAction = a; done(null); }); line.append(b); });
     T.cursor.before(line); T.cursor.hidden = true; T.fast = reduceMotion;
     setTimeout(()=>inp.focus(), 40);
     let fin = false;
@@ -2243,28 +2299,67 @@ function termClose(){
 async function unlockFlow(){
   let fails = 0;
   for(;;){
-    const v = await tAsk("Passcode", {secret:true});
-    if(v && await checkPass(v)){ await tType("Unlocked.\n", 16, "tdim"); markUnlocked(); return; }
+    const v = await tAsk("Password", {secret:true, actions: fails>=3 ? ["forgot it?"] : []});
+    if(v==null){ await confirmErase(); continue; }
+    if(v && await checkPass(v)){
+      await tType("Unlocked.\n", 16, "tdim"); markUnlocked();
+      if(!userName()){ await tType("One more thing.\n", 10, "tdim"); await nameFlow(false); }
+      return;
+    }
     fails++;
     await tType("That's not it. Try again.\n", 14, "tbad");
-    if(fails===3) await tType("Forgot it? Ask Claude in chat to reset your Glovebox passcode.\n", 6, "tdim");
+    if(fails===3) await tType("Forgot it? Passwords can't be recovered, but you can erase this device and start over.\n", 6, "tdim");
     if(fails>=5){ await tType("Too many tries. Wait 30 seconds.\n", 10, "tbad"); await sleep(30000); fails = 3; }
   }
 }
-async function setupFlow(mode){   // mode: "first" | "set" | "change"
-  const act = mode==="first" ? ["skip"] : ["cancel"];
+async function confirmErase(){
+  await tType("\nErase this device? This deletes your account and everything Glovebox saved in this browser. It can't be undone.\n", 6, "tbad");
+  const c = await tChoose(["Erase everything", "Keep it"]);
+  if(c!=="Erase everything") return false;
+  await tType("Erasing… Glovebox will start fresh.\n", 10, "tdim");
+  eraseDevice();
+  return new Promise(()=>{});   // page reloads
+}
+async function nameFlow(cancelable){
   for(;;){
-    const a = await tAsk(mode==="change" ? "New passcode (leave empty to turn the lock off)" : "New passcode", {secret:true, actions:act});
+    const v = await tAsk("Your name", {name:true, actions: cancelable ? ["cancel"] : []});
+    if(v==null) return null;
+    const n = v.trim().replace(/\s+/g, " ").slice(0, 40);
+    if(!n){ await tType("Type a name to continue.\n", 10, "tbad"); continue; }
+    saveName(n);
+    await tType("Nice to meet you, " + n + ".\n", 10, "tdim");
+    return n;
+  }
+}
+async function setupFlow(mode){   // mode: "first" | "change"
+  const first = mode==="first";
+  for(;;){
+    const a = await tAsk(first ? "Create a password" : "New password", {secret:true, actions: first ? [] : ["cancel"]});
     if(a==null) return "cancel";
-    if(a==="" && mode==="change"){ clearPass(); await tType("Lock turned off.\n", 12, "tdim"); return "off"; }
     if(a.length < 4){ await tType("Use at least 4 characters.\n", 10, "tbad"); continue; }
-    const b = await tAsk("Confirm passcode", {secret:true, actions:["cancel"]});
-    if(b==null) return "cancel";
+    const b = await tAsk("Confirm password", {secret:true, actions: first ? ["start over"] : ["cancel"]});
+    if(b==null){ if(first) continue; return "cancel"; }
     if(b!==a){ await tType("Those didn't match. Try again.\n", 10, "tbad"); continue; }
     await savePass(a); markUnlocked();
-    await tType("Passcode saved. Glovebox will ask for it every time you open it.\n", 8, "tdim");
+    await tType(first ? "Account created. Glovebox will ask for your password every time you open it.\n" : "Password changed.\n", 8, "tdim");
     return "saved";
   }
+}
+async function signupFlow(){
+  termShow(); T.el.classList.add("locked");
+  await tType(greetText("Welcome to", "Glovebox."), 30, "tgreet");
+  await tType(todayLabel(), 10, "tdate");
+  await tType("Let's set up your account. It stays in this browser, on this device only.\n", 8, "tdim");
+  if(!userName()) await nameFlow(false);
+  await setupFlow("first");
+}
+async function lockScreen(){
+  termShow(); T.el.classList.add("locked");
+  await tType(greeting(), 18, "tgreet");
+  await tType(todayLabel(), 8, "tdate");
+  await tType("Glovebox is locked.\n", 10, "tdim");
+  await showDaily(true);
+  await unlockFlow(); await sleep(450); termClose();
 }
 
 /* ---------- quote + word of the day ---------- */
@@ -2897,26 +2992,38 @@ async function showDaily(instant){
 }
 
 function todayLabel(){ return new Date().toLocaleDateString(undefined,{weekday:"long", month:"long", day:"numeric"}); }
+// size the cover-page greeting: --gw = widest line (two-line phones), --gw1 = whole greeting on one line (wide screens), in em of .tgreet
+function fitGreet(l1, l2){
+  const b = document.getElementById("boot"); if(!b) return;
+  const host = b.querySelector("#bootlog") || b;
+  const m = document.createElement("span"); m.className = "tgreet"; m.setAttribute("aria-hidden", "true");
+  m.style.cssText = "position:absolute;left:-9999px;top:0;visibility:hidden;display:inline-block;width:auto;white-space:pre;font-size:100px;margin:0";
+  host.appendChild(m);
+  const w = t => { m.textContent = t; return m.getBoundingClientRect().width / 100; };
+  const gw = Math.max(w(l1), l2 ? w(l2) : 0), gw1 = l2 ? w(l1 + " " + l2) : gw;
+  m.remove();
+  if(gw > 0){ b.style.setProperty("--gw", gw.toFixed(2)); b.style.setProperty("--gw1", Math.max(gw1, gw).toFixed(2)); }
+}
+function greetText(l1, l2){
+  fitGreet(l1, l2);
+  if(document.fonts && document.fonts.status!=="loaded") document.fonts.ready.then(()=>fitGreet(l1, l2)).catch(()=>{});
+  return l2 ? l1 + "\n" + l2 : l1;
+}
 function greeting(){
   const h = new Date().getHours(), i = h < 12 ? 0 : h < 17 ? 1 : 2;
-  // line widths in em (Space Grotesk 600): first line for two-line phones, whole greeting for one-line wide screens
-  const b = document.getElementById("boot"); if(b){ b.style.setProperty("--gw", [6.47, 7.23, 6.29][i]); b.style.setProperty("--gw1", [9.36, 10.12, 9.18][i]); }
-  return ["Good morning", "Good afternoon", "Good evening"][i] + ",\nCaleb.";
+  const hello = ["Good morning", "Good afternoon", "Good evening"][i], name = userName();
+  return name ? greetText(hello + ",", name + ".") : greetText(hello + ".", "");
 }
 async function runBoot(){
   const el = $("#boot");
   const wantBoot = !reduceMotion && Date.now() - (+lsGet("glovebox-boot") || 0) >= LOCK_MS;
-  const needLock = true;   // passcode on every entry
-  if(!wantBoot){
-    if(!lockInfo){ if(el) el.classList.add("live"); await waitLockKnown(3500); }
-    if(!lockInfo){ if(el){ el.classList.remove("live"); el.hidden = true; } return; }
-    termShow(); T.el.classList.add("locked");
-    await tType(greeting(), 18, "tgreet");
-    await tType(todayLabel(), 8, "tdate");
-    await tType("Glovebox is locked.\n", 10, "tdim");
-    await showDaily(true);
-    await unlockFlow(); await sleep(450); return termClose();
+  if(!lockInfo){ if(el) el.classList.add("live"); await waitLockKnown(3500); }
+  if(!lockInfo){   // first open on this device: create the account (name + password)
+    lsSet("glovebox-boot", String(Date.now()));
+    await signupFlow(); await sleep(T && T.fast ? 250 : 700);
+    return termClose();
   }
+  if(!wantBoot) return lockScreen();
   lsSet("glovebox-boot", String(Date.now()));
   termShow();
   await tType(greeting(), 34, "tgreet"); if(!T.fast) await sleep(250);
@@ -2925,40 +3032,33 @@ async function runBoot(){
   const open = [...items.values()].filter(i=>!i.done && i.kind!=="event").length, hs = habits.size;
   await tType(open+" open item"+(open===1?"":"s")+", "+hs+" habit"+(hs===1?"":"s")+"\n", 10, "tdim");
   const daily = showDaily(false);
-  let prompted = false;
-  if(needLock){
-    if(!lockInfo) await waitLockKnown(3500);
-    if(lockInfo){ prompted = true; await unlockFlow(); }
-    else if(!lsGet("glovebox-lock-skip")){
-      prompted = true;
-      await tType("\nSet a passcode to lock Glovebox, or skip for now.\n", 8, "tdim");
-      const r = await setupFlow("first");
-      if(r==="cancel"){ lsSet("glovebox-lock-skip", "1"); await tType("Skipped. You can set one later from Lists.\n", 10, "tdim"); }
-    }
-  }
+  await unlockFlow();   // password on every entry
   if(!T.fast) await sleep(140);
   await daily;
-  if(prompted) await sleep(T && T.fast ? 250 : 600);
-  else for(let t = 0; t < 2600 && T && !T.fast; t += 100) await sleep(100);   // time to read; tap to skip
+  await sleep(T && T.fast ? 250 : 600);
   termClose();
 }
 
-async function passSettings(){
+async function accountSettings(){
   if(T) return;
   termShow(); T.el.classList.add("locked");
-  if(lockInfo){
-    await tType("Change passcode", 14, "tgreet");
-    const cur = await tAsk("Current passcode", {secret:true, actions:["cancel"]});
-    if(cur==null){ await tType("Cancelled.\n", 10, "tdim"); }
-    else if(!(await checkPass(cur))){ await tType("Wrong passcode.\n", 12, "tbad"); }
-    else { const r = await setupFlow("change"); if(r==="cancel") await tType("Cancelled.\n", 10, "tdim"); }
-  } else {
-    await tType("Set a passcode", 14, "tgreet");
-    const r = await setupFlow("set"); if(r==="cancel") await tType("Cancelled.\n", 10, "tdim");
+  const name = userName();
+  await tType(greetText("Account", ""), 14, "tgreet");
+  await tType((name ? "Signed in as " + name : "Signed in") + " on this device.\n", 8, "tdim");
+  if(!lockInfo){ await signupFlow(); await sleep(600); return termClose(); }
+  const cur = await tAsk("Password", {secret:true, actions:["cancel"]});
+  if(cur==null){ await tType("Cancelled.\n", 10, "tdim"); }
+  else if(!(await checkPass(cur))){ await tType("Wrong password.\n", 12, "tbad"); }
+  else {
+    const c = await tChoose(["Change name", "Change password", "Lock now", "Erase this device", "Done"]);
+    if(c==="Change name"){ if(await nameFlow(true)==null) await tType("Cancelled.\n", 10, "tdim"); }
+    else if(c==="Change password"){ const r = await setupFlow("change"); if(r==="cancel") await tType("Cancelled.\n", 10, "tdim"); }
+    else if(c==="Lock now"){ termClose(); await sleep(420); return lockScreen(); }
+    else if(c==="Erase this device"){ await confirmErase(); }
   }
   await sleep(600); termClose();
 }
-$("#passBtn").addEventListener("click", passSettings);
+$("#passBtn").addEventListener("click", accountSettings);
 $("#toastUndo").addEventListener("click", ()=>{
   if(!gLastDeleted) return;
   const recs = gLastDeleted; gLastDeleted = null;
@@ -2969,8 +3069,7 @@ $("#toastUndo").addEventListener("click", ()=>{
 document.addEventListener("visibilitychange", ()=>{
   if(document.hidden){ hiddenAt = Date.now(); return; }
   if(lockInfo && !T && hiddenAt && Date.now() - hiddenAt >= 15e3){
-    termShow(); T.el.classList.add("locked");
-    tType(greeting(), 18, "tgreet").then(()=>tType(todayLabel(), 8, "tdate")).then(()=>tType("Glovebox is locked.\n", 10, "tdim")).then(()=>showDaily(true)).then(unlockFlow).then(()=>sleep(450)).then(termClose);
+    lockScreen();
   }
 });
 
